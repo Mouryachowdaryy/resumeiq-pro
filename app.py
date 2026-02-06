@@ -1,10 +1,8 @@
 from flask import Flask, request, render_template, jsonify, session, redirect, url_for
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationChain
-from langchain.chains.conversation.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
 import pdfplumber
-from docx import Document
 import json
 import os
 import re
@@ -51,14 +49,13 @@ def parse_pdf(file_path):
         print(f"PDF parsing error: {e}")
         return ""
 
-def parse_docx(file_path):
-    """Extract text from DOCX"""
+def parse_txt(file_path):
+    """Extract text from TXT file"""
     try:
-        doc = Document(file_path)
-        text = "\n".join([para.text for para in doc.paragraphs])
-        return text
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
     except Exception as e:
-        print(f"DOCX parsing error: {e}")
+        print(f"TXT parsing error: {e}")
         return ""
 
 def extract_contact_info(text):
@@ -111,8 +108,8 @@ def parse_resume(file_path):
     # Determine file type and parse
     if file_path.endswith('.pdf'):
         text = parse_pdf(file_path)
-    elif file_path.endswith('.docx'):
-        text = parse_docx(file_path)
+    elif file_path.endswith('.txt'):
+        text = parse_txt(file_path)
     else:
         text = ""
     
@@ -136,10 +133,10 @@ def parse_job_description(file_path=None, text=None):
     if file_path:
         if file_path.endswith('.pdf'):
             jd_text = parse_pdf(file_path)
-        elif file_path.endswith('.docx'):
-            jd_text = parse_docx(file_path)
+        elif file_path.endswith('.txt'):
+            jd_text = parse_txt(file_path)
         else:
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 jd_text = f.read()
     else:
         jd_text = text or ""
@@ -229,11 +226,10 @@ def analyze_with_ai(resume_data, jd_data, match_results):
     matched_skills_text = ", ".join([s['skill'] for s in match_results['matched_flat'][:15]])
     missing_skills_text = ", ".join([s['skill'] for s in match_results['missing_flat'][:15]])
     
-    prompt_template = PromptTemplate(
-        input_variables=["resume", "job_description", "ats_score", "matched_skills", "missing_skills"],
-        template="""You are an expert HR recruiter and career strategist analyzing a candidate's fit for a role.
-
-JOB DESCRIPTION:
+    # Create prompt using ChatPromptTemplate (Python 3.13 compatible)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an expert HR recruiter and career strategist analyzing a candidate's fit for a role."),
+        ("human", """JOB DESCRIPTION:
 {job_description}
 
 RESUME SUMMARY:
@@ -271,15 +267,16 @@ PROVIDE COMPREHENSIVE EVALUATION IN JSON FORMAT:
   "resume_tips": "Specific optimization suggestions"
 }}
 
-Return ONLY valid JSON, no other text."""
-    )
+Return ONLY valid JSON, no other text.""")
+    ])
     
     try:
         # Prepare inputs
         resume_summary = resume_data['raw_text'][:2000]  # Limit length
         jd_summary = jd_data['text'][:2000]
         
-        formatted_prompt = prompt_template.format(
+        # Format messages
+        messages = prompt.format_messages(
             resume=resume_summary,
             job_description=jd_summary,
             ats_score=match_results['overall_score'],
@@ -288,7 +285,7 @@ Return ONLY valid JSON, no other text."""
         )
         
         # Get AI response
-        response = llm.invoke(formatted_prompt)
+        response = llm.invoke(messages)
         response_text = response.content
         
         # Try to extract JSON
@@ -339,59 +336,6 @@ Return ONLY valid JSON, no other text."""
             "learning_plan_90": "Build real-world project portfolio",
             "resume_tips": "Add more quantifiable achievements and keywords"
         }
-
-# ============================================================================
-# CHATBOT ENGINE
-# ============================================================================
-
-def initialize_chatbot(analysis_context):
-    """Initialize chatbot with full analysis context"""
-    
-    context_prompt = f"""You are ResumeIQ Pro's AI Career Coach. You just analyzed a resume.
-
-ANALYSIS CONTEXT:
-
-Candidate: {analysis_context['candidate_name']}
-Target Role: {analysis_context['job_title']}
-ATS Score: {analysis_context['ats_score']}/100
-Role-Fit Score: {analysis_context['role_fit_score']}/5.0
-
-MATCHED SKILLS ({len(analysis_context['matched_skills'])}):
-{', '.join(analysis_context['matched_skills'][:20])}
-
-MISSING SKILLS ({len(analysis_context['missing_skills'])}):
-{', '.join(analysis_context['missing_skills'][:20])}
-
-TOP STRENGTHS:
-{chr(10).join(analysis_context['strengths'][:3])}
-
-KEY GAPS:
-{chr(10).join(analysis_context['weaknesses'][:3])}
-
-YOUR ROLE:
-- Answer questions about THIS specific analysis
-- Cite specific evidence from resume or analysis
-- Keep responses 50-150 words
-- Be professional, honest, actionable
-- No hallucinations - only reference provided data
-
-Ready to help. Answer user questions about their resume analysis."""
-
-    memory = ConversationBufferMemory()
-    
-    chatbot_chain = ConversationChain(
-        llm=llm,
-        memory=memory,
-        verbose=False
-    )
-    
-    # Store context in memory
-    memory.save_context(
-        {"input": "System initialization"},
-        {"output": context_prompt}
-    )
-    
-    return chatbot_chain
 
 # ============================================================================
 # FLASK ROUTES
@@ -460,9 +404,15 @@ def analyze():
         session['analysis'] = complete_analysis
         
         # Clean up uploaded files
-        os.remove(resume_path)
+        try:
+            os.remove(resume_path)
+        except Exception:
+            pass
         if jd_file:
-            os.remove(jd_path)
+            try:
+                os.remove(jd_path)
+            except Exception:
+                pass
         
         return jsonify(complete_analysis)
         
@@ -517,7 +467,7 @@ def analyze_multi():
                     'missing_skills_count': len(match_results['missing_flat']),
                     'top_matched_skills': [s['skill'] for s in match_results['matched_flat'][:8]],
                     'top_missing_skills': [s['skill'] for s in match_results['missing_flat'][:8]],
-                    'summary': ai_analysis.get('summary', ''),
+                    'summary': ai_analysis.get('overall_fit', ''),
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
             finally:
@@ -564,7 +514,7 @@ def results():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Chatbot endpoint"""
+    """Chatbot endpoint - Direct LLM invocation (Python 3.13 compatible)"""
     try:
         data = request.json
         user_message = data.get('message', '')
@@ -573,21 +523,11 @@ def chat():
         if not analysis:
             return jsonify({'error': 'No analysis found'}), 400
         
-        # Initialize or get chatbot from session
+        # Mark chatbot as initialized
         if 'chatbot_initialized' not in session:
-            chatbot_context = {
-                'candidate_name': analysis['candidate_name'],
-                'job_title': analysis['job_title'],
-                'ats_score': analysis['ats_score'],
-                'role_fit_score': analysis['role_fit_score'],
-                'matched_skills': analysis['matched_skills'][:15],
-                'missing_skills': analysis['missing_skills'][:15],
-                'strengths': analysis['ai_analysis']['strengths'],
-                'weaknesses': analysis['ai_analysis']['weaknesses']
-            }
             session['chatbot_initialized'] = True
         
-        # Get response from LLM
+        # Build prompt directly (no deprecated chains/memory)
         chatbot_prompt = f"""You are ResumeIQ Pro's friendly in-app assistant.
 
 Goal: Help the user understand the resume analysis and next steps. Speak like a helpful product coach (not a generic LLM).
@@ -612,6 +552,7 @@ Analysis context:
 
 Answer now."""
 
+        # Direct LLM invocation (Python 3.13 safe)
         response = llm.invoke(chatbot_prompt)
         bot_message = response.content
         
@@ -619,11 +560,12 @@ Answer now."""
         
     except Exception as e:
         print(f"Chat Error: {e}")
+        traceback.print_exc()
         return jsonify({'error': 'Failed to get response'}), 500
 
 @app.route('/batch', methods=['POST'])
 def batch_analyze():
-    """Batch resume analysis for recruiters"""
+    """Batch resume analysis for recruiters (API endpoint)"""
     try:
         files = request.files.getlist('resumes')
         jd_text = request.form.get('jd_text', '')
@@ -655,7 +597,10 @@ def batch_analyze():
                     'top_skills': [s['skill'] for s in match_results['matched_flat'][:3]]
                 })
                 
-                os.remove(file_path)
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
                 
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
@@ -668,6 +613,7 @@ def batch_analyze():
         
     except Exception as e:
         print(f"Batch Analysis Error: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

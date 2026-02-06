@@ -3,9 +3,7 @@ pdfplumber
 python-dotenv
 requests
 
-langchain==0.2.16
-langchain-core==0.2.38
-langchain-groq==0.1.9
-langsmith==0.1.125
-
-pydantic==1.10.13
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq
+langsmith
